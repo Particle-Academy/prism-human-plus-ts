@@ -10,8 +10,10 @@ import { ToolDefinition, ToolRefused, TrustPolicy } from '../src/index.js';
  * reserved here too — a name refused there and callable here is an agent
  * approving its own proposals, and nothing errors to say so.
  *
- * THIS PORT FAILS THAT, ON ONE INPUT. `adm-0011` is pinned below in the
- * NEGATIVE and is a real security defect, not a stylistic drift. See G-33.
+ * This port USED to fail that on one input — `terminal_confirm` with a trailing
+ * newline was reserved in the reference and in Python and callable here, because
+ * `$` matches before a final newline in PCRE and Python and not in JavaScript
+ * (G-33). Closed by normalising the name; the tests below keep it closed.
  */
 interface Decision {
   digest: string;
@@ -81,7 +83,7 @@ const caseOf = (id: string): CorpusCase => corpus.cases.find((entry) => entry.id
 
 describe('the cross-language tool-admission corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(20);
+    expect(corpus.cases).toHaveLength(25);
   });
 
   it.each(corpus.cases)('$id decides the way the corpus recorded ($title)', (entry) => {
@@ -89,10 +91,10 @@ describe('the cross-language tool-admission corpus', () => {
   });
 
   it('reserves confirmation for the human even under WILDCARD trust', () => {
-    // The property the Lab probes live at /lab/team, and it holds here — for a
-    // name with no trailing whitespace. See the next test for the one it
-    // does not hold for, which is why a live probe on a clean name is not
-    // enough on its own.
+    // The property the Lab probes live at /lab/team, on a clean tool name.
+    // That probe was green while G-33 and G-36 were both open, which is why the
+    // next test exists: the interesting question is not whether a clean name is
+    // reserved but whether a name the SURFACE chose adversarially still is.
     const entry = caseOf('adm-0005');
     const decision = decide(entry);
 
@@ -101,26 +103,46 @@ describe('the cross-language tool-admission corpus', () => {
     expect(decision.admitted).toBe(false);
   });
 
-  it('ADMITS a confirm name with a trailing newline that the reference reserves', () => {
-    // G-33, and a security defect in THIS port rather than a drift.
+  it('reserves a confirm name whatever INVISIBLE character trails it', () => {
+    // G-33 and G-36, both CLOSED — and this is the test that keeps them closed.
     //
-    // `/(?:^|_)(?:confirm|…)$/i` — `$` without the `m` flag matches only at the
-    // very end of the string in JavaScript, while PCRE and Python also match
-    // before a final newline. So `terminal_confirm\n` is reserved for the human
-    // in the reference and in the Python port, and handed to the agent here.
+    // A tool name is chosen by the SURFACE, and `$` anchors at the end. This
+    // port matched only at the very end, so a trailing newline slipped past
+    // here while the reference and Python reserved it (G-33); and a trailing
+    // SPACE slipped past in all three (G-36), handing the confirmation tool to
+    // the agent under every trust level including the wildcard.
     //
-    // A surface chooses its own tool names, so the newline is attacker-
-    // controlled: one surface is safe against a PHP or Python agent and gives
-    // this one the confirmation tool. Pinned in the NEGATIVE — closing G-33
-    // turns this red, which is the point.
-    const entry = caseOf('adm-0011');
-    const decision = decide(entry);
+    // The normalisation strips an EXPLICIT codepoint set, spelled identically
+    // in all three languages. That detail IS the fix: the built-ins disagree
+    // three ways — this language's `.trim()` strips every one of these
+    // including U+FEFF, PHP's strips none of the Unicode ones, and Python's
+    // strips them except U+FEFF — so reaching for `.trim()` would have closed
+    // one hole and opened three new divergences.
+    const reserved = ['adm-0005', 'adm-0011', 'adm-0019', 'adm-0020', 'adm-0021', 'adm-0022', 'adm-0023', 'adm-0024', 'adm-0025'];
 
-    expect(entry.tool.name.endsWith('\n')).toBe(true);
-    expect(decision.allows).toBe(true);
-    expect(decision.admitted).toBe(true);
-    expect(entry.admission.php.allows).toBe(false);
-    expect(entry.admission.py.allows).toBe(false);
+    for (const id of reserved) {
+      const entry = caseOf(id);
+
+      expect(decide(entry).allows, id).toBe(false);
+      expect(decide(entry).admitted, id).toBe(false);
+      // And the other two agree, which is the half a single-language suite
+      // cannot check and the half that was actually broken.
+      expect(entry.admission.php.allows, id).toBe(false);
+      expect(entry.admission.py.allows, id).toBe(false);
+    }
+  });
+
+  it('still admits the names that merely LOOK like a reserved verb', () => {
+    // The other half of a reservation, and the half a fix like this can break.
+    // Normalising only ever reserves MORE names, so these prove it did not
+    // over-reach: `confirmation_status` and `preconfirm` stay callable.
+    for (const id of ['adm-0009', 'adm-0010']) {
+      const entry = caseOf(id);
+
+      expect(decide(entry).admitted, id).toBe(true);
+      expect(entry.admission.php.admitted, id).toBe(true);
+      expect(entry.admission.py.admitted, id).toBe(true);
+    }
   });
 
   it('digests a tool with NO schema differently from the reference', () => {
@@ -138,35 +160,12 @@ describe('the cross-language tool-admission corpus', () => {
     expect(decide(entry).digest).not.toBe(entry.admission.php.digest);
   });
 
-  it('ADMITS a confirm name with one trailing space, and so does every other language', () => {
-    // G-36, and the worst finding in this suite precisely BECAUSE all three
-    // agree. `$` tolerates at most one trailing newline in PCRE and Python and
-    // none here, and nothing normalises the name before matching — so a surface
-    // that calls its tool `terminal_confirm ` gets the confirmation tool handed
-    // to the agent in every language.
-    //
-    // A cross-language corpus cannot find this by COMPARING languages; there is
-    // nothing to compare. Asserted in the POSITIVE, describing the hole rather
-    // than a guarantee, so the day someone closes it this row goes red.
-    //
-    // adm-0020 is the same hole reached by a second newline, which is why a fix
-    // that only special-cases a single trailing newline — the shape of G-33 —
-    // is visibly not enough.
-    for (const id of ['adm-0019', 'adm-0020']) {
-      const entry = caseOf(id);
-
-      expect(entry.policy.mode).toBe('everyTool');
-      expect(decide(entry).admitted, id).toBe(true);
-      expect(entry.admission.php.admitted, id).toBe(true);
-      expect(entry.admission.py.admitted, id).toBe(true);
-    }
-  });
-
   it('agrees with the reference on the pin, the allowlist and every clean name', () => {
-    // Everything except the three registered rows. Asserted as a set so a NEW
-    // divergence has somewhere to fail rather than disappearing into a row that
-    // was already red.
-    const known = new Set(['adm-0011', 'adm-0016', 'adm-0018']);
+    // Everything except the two digest rows still registered (G-34, G-35).
+    // Asserted as a set so a NEW divergence has somewhere to fail rather than
+    // disappearing into a row that was already red — and so that closing either
+    // one turns this red rather than leaving a stale exemption behind.
+    const known = new Set(['adm-0016', 'adm-0018']);
     const unexpected = corpus.cases
       .filter((entry) => !entry.agrees && !known.has(entry.id))
       .map((entry) => entry.id);
