@@ -83,7 +83,7 @@ const caseOf = (id: string): CorpusCase => corpus.cases.find((entry) => entry.id
 
 describe('the cross-language tool-admission corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(25);
+    expect(corpus.cases).toHaveLength(32);
   });
 
   it.each(corpus.cases)('$id decides the way the corpus recorded ($title)', (entry) => {
@@ -137,6 +137,39 @@ describe('the cross-language tool-admission corpus', () => {
     // Normalising only ever reserves MORE names, so these prove it did not
     // over-reach: `confirmation_status` and `preconfirm` stay callable.
     for (const id of ['adm-0009', 'adm-0010']) {
+      const entry = caseOf(id);
+
+      expect(decide(entry).admitted, id).toBe(true);
+      expect(entry.admission.php.admitted, id).toBe(true);
+      expect(entry.admission.py.admitted, id).toBe(true);
+    }
+  });
+
+  it('REFUSES a name that is not well formed, in all three languages', () => {
+    // The name rule, and the reason it exists beyond tidiness.
+    //
+    // adm-0026 is the one worth reading. A Cyrillic `с` in `сonfirm` does NOT
+    // bypass the reservation — it genuinely is not `confirm`, so not reserving
+    // it is correct — but a human reading an allowlist cannot tell it from the
+    // real one. The hole is in the HUMAN's ability to audit the trust config,
+    // which is the other half of the same trust model. An ASCII-only name rule
+    // closes it; a cleverer regex over the reserved word never could.
+    for (const id of ['adm-0026', 'adm-0027', 'adm-0028', 'adm-0029', 'adm-0030']) {
+      const entry = caseOf(id);
+
+      expect(decide(entry).allows, id).toBe(false);
+      expect(decide(entry).admitted, id).toBe(false);
+      expect(entry.admission.php.allows, id).toBe(false);
+      expect(entry.admission.py.allows, id).toBe(false);
+    }
+  });
+
+  it('still ADMITS the namespaced and hyphenated names real surfaces use', () => {
+    // The direction a name rule breaks things, and the reason this one is not
+    // stricter. Dots, colons and hyphens are how surfaces namespace tools; a
+    // rule that refused `vendor.tool` or `web-search` would be unusable and
+    // would get removed, taking the homoglyph guard with it.
+    for (const id of ['adm-0031', 'adm-0032']) {
       const entry = caseOf(id);
 
       expect(decide(entry).admitted, id).toBe(true);

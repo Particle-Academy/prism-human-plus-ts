@@ -311,6 +311,10 @@ export class TrustPolicy {
   }
 
   assertAllows(tool: ToolDefinition): void {
+    if (!isWellFormedName(tool.name)) {
+      throw new ToolRefused(`Human+ tool name [${tool.name}] is not a well-formed tool name.`);
+    }
+
     if (isHumanOnly(tool.name)) {
       throw new ToolRefused(
         `Human+ tool [${tool.name}] is reserved for the human confirmation surface.`,
@@ -329,10 +333,40 @@ export class TrustPolicy {
   }
 
   allows(name: string): boolean {
+    if (!isWellFormedName(name)) return false;
     if (isHumanOnly(name)) return false;
 
     return this.everyToolAllowed || (this.allowedTools ?? []).includes(name);
   }
+}
+
+/**
+ * What a tool name may BE, checked before anything is asked about it.
+ *
+ * ASCII letters and digits, underscore, dot, colon and hyphen; a letter, digit
+ * or underscore first; at most 128 characters. That accepts every name this
+ * ecosystem actually uses — `terminal_confirm`, `sheet_write`, `web_search`,
+ * `fetch_url`, namespaced `vendor.tool` — and refuses everything else.
+ *
+ * ASCII-ONLY IS THE POINT, and it is what makes a homoglyph impossible. A
+ * surface can otherwise declare `сonfirm` with a Cyrillic `с`: it is not the
+ * reserved word, so the reservation correctly does not fire, and a human
+ * reading the allowlist cannot tell it from the real one. That is not a hole in
+ * the regex — it is a hole in the HUMAN's ability to audit the trust config,
+ * which is the other half of the same trust model.
+ *
+ * Interior whitespace and control characters go the same way, which makes this
+ * the outer guard for the class of problem the trailing-invisible normalisation
+ * fixed one instance of. Both are kept: normalisation stays as defence in depth
+ * in case this is ever relaxed.
+ *
+ * `$` here is end-of-string because there is no `m` flag — the one place where
+ * this language's anchor is the STRICT one, and PCRE and Python are the two
+ * that need `\z` / `\Z` to say the same thing. Getting that backwards is how
+ * `terminal_confirm\n` slipped past the reservation in the first place.
+ */
+function isWellFormedName(name: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/.test(name);
 }
 
 /**
