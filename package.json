@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Humans and agents sharing one surface, across a trust boundary. TypeScript.",
   "type": "module",
-  "private": true,
   "sideEffects": false,
   "engines": {
     "node": ">=20"
