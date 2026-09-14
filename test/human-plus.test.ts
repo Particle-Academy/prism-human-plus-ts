@@ -735,6 +735,20 @@ describe('the SSE + POST relay', () => {
     ).rejects.toThrowError(/is not declared by local Human\+ policy/);
   });
 
+  it('refuses a hostile relay URL without first spending minutes on its slashes', async () => {
+    // Trailing slashes are stripped BEFORE the policy checks, so this ran on
+    // any URL an invitation carried. replace(/\/+$/, '') is quadratic on a run
+    // of slashes that does not end the string: this one took over a minute.
+    const http = new FakeHttp();
+    const url = 'https://evil.test/' + '/'.repeat(400_000) + 'x';
+    const started = performance.now();
+
+    await expect(transport(http).notify(relayAttachment({ relayBaseUrl: url }), { jsonrpc: '2.0' })).rejects.toThrowError(
+      /is not declared by local Human\+ policy/,
+    );
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it('refuses a relay URL carrying credentials, a query, or a fragment', async () => {
     const http = new FakeHttp();
 

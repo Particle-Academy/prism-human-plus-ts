@@ -142,6 +142,23 @@ export class SurfaceInvitation {
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
 
 /**
+ * A URL with every trailing slash removed, in one pass.
+ *
+ * Not `replace(/\/+$/, '')`, which retries from every slash in a run: a relay
+ * URL carrying 400,000 slashes before its last character held the event loop
+ * for over a minute, and it ran before any policy check could refuse the URL.
+ */
+function withoutTrailingSlashes(url: string): string {
+  let end = url.length;
+
+  while (end > 0 && url.charCodeAt(end - 1) === 0x2f) {
+    end -= 1;
+  }
+
+  return url.slice(0, end);
+}
+
+/**
  * One agent's seat on one surface.
  *
  * `generation` is what makes concurrent workers safe: a store can refuse a
@@ -1146,7 +1163,7 @@ export class SsePostRelayTransport implements RelayTransport {
   }
 
   private base(attachment: SurfaceAttachment): string {
-    const url = attachment.invitation.relayBaseUrl.replace(/\/+$/, '');
+    const url = withoutTrailingSlashes(attachment.invitation.relayBaseUrl);
 
     if (this.#egressProxy === null && !this.#allowUnverifiedEgress) {
       throw new AttachmentUnauthorized(
