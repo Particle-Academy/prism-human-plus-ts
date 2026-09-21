@@ -12,6 +12,7 @@ jobs:
   test:
     name: node ${{ matrix.node }}
     runs-on: ubuntu-latest
+    needs: third-party
     timeout-minutes: 10
     strategy:
       fail-fast: false
