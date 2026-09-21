@@ -37,6 +37,82 @@ export class SurfaceUnavailable extends HumanPlusError {
 }
 
 /** Local policy refused, before anything reached the surface. */
+/**
+ * The surface moved between the agent's read and its write.
+ *
+ * ## What this replaces, which is nothing
+ *
+ * Before this existed, a human committing an edit while an agent was mid-turn
+ * produced NO failure at all. The agent's write landed on top, the human's
+ * change was gone, and the only party who could tell was the person watching
+ * their work disappear. A lost update reports nothing by construction: both
+ * writes succeeded, and that is exactly the problem.
+ *
+ * So this is not a nicer error for an existing failure. It is the first time
+ * that failure is visible.
+ *
+ * ## It is raised for the agent, not only for the log
+ *
+ * The message is written to be read by a MODEL mid-turn, because that is who
+ * receives it: the turn continues, the agent sees the refusal as a tool result,
+ * and the useful next move — re-read, then decide — has to be legible from the
+ * text alone. `code` is there so a host can branch without matching prose.
+ */
+export class SurfaceChangedUnderYou extends HumanPlusError {
+  readonly code = 'surface_changed_under_you';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'SurfaceChangedUnderYou';
+  }
+
+  static while(tool: string, sent: SurfaceRevision | null): SurfaceChangedUnderYou {
+    const seen =
+      sent === null
+        ? 'You were working from a surface state whose revision was never recorded.'
+        : `You were working from the surface as it looked at revision ${sent.token}, observed when you called \`${sent.observedFrom}\`.`;
+
+    return new SurfaceChangedUnderYou(
+      `The surface changed while you were working on it, so \`${tool}\` was NOT applied.\n\n` +
+        `${seen} Someone else — a person editing the same surface, or another participant — has ` +
+        'committed a change since then.\n\n' +
+        'Nothing was written and nothing was lost. Read the surface again before deciding what to ' +
+        'do: the state you were reasoning about is out of date, and repeating this call with the ' +
+        'same arguments is how the other change gets overwritten.',
+    );
+  }
+}
+
+/**
+ * The surface refused a pinned call because the marker was stale.
+ *
+ * Internal to the client. The manager catches it and re-raises
+ * {@link SurfaceChangedUnderYou}, which is the failure a consumer branches on.
+ */
+export class SurfaceRevisionRejected extends HumanPlusError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SurfaceRevisionRejected';
+  }
+}
+
+/** A run demanded proof of conflict detection from a surface that mints none. */
+export class ConflictDetectionUnavailable extends HumanPlusError {
+  readonly code = 'conflict_detection_unavailable';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictDetectionUnavailable';
+  }
+
+  static forSurface(surface: string, tool: string): ConflictDetectionUnavailable {
+    return new ConflictDetectionUnavailable(
+      `Surface [${surface}] mints no revision, so calling \`${tool}\` cannot be protected from a ` +
+        'lost update. This run requires conflict detection.',
+    );
+  }
+}
+
 export class ToolRefused extends HumanPlusError {
   constructor(message: string) {
     super(message);
@@ -54,6 +130,46 @@ export const ATTACHMENT_STATES = [
 ] as const;
 
 export type AttachmentState = (typeof ATTACHMENT_STATES)[number];
+
+/**
+ * How much lost-update protection this surface has actually been OBSERVED to
+ * have — which is less than "is configured for".
+ *
+ * Not a boolean, and the reference learned that the hard way. It was one, and
+ * it answered "does this surface mint revisions" while its documentation
+ * claimed a lost update would be caught. The first integrator minted on every
+ * write result and read an incoming pin nowhere, so the detector said `true`
+ * and every update would still have been lost.
+ *
+ * - `not_observed` — nothing is known; the surface has not answered.
+ * - `unavailable` — it answered and minted nothing. Writes are unpinned and a
+ *   concurrent edit WILL be lost silently. The one definite negative.
+ * - `minted` — it mints, so every call is pinned. **Whether it ENFORCES the pin
+ *   is not observable from here.** Half a green light.
+ * - `enforced` — it has actually refused a stale pin. Proven, because it
+ *   happened.
+ *
+ * There is no "require enforcement" mode: a surface with one writer never
+ * rejects anything and is indistinguishable from one that cannot, so a flag
+ * demanding proof would refuse every write on a healthy surface.
+ */
+export const CONFLICT_DETECTIONS = ['not_observed', 'unavailable', 'minted', 'enforced'] as const;
+
+export type ConflictDetection = (typeof CONFLICT_DETECTIONS)[number];
+
+/** One sentence saying exactly what is known, for an operator or a log. */
+export function describeConflictDetection(state: ConflictDetection): string {
+  switch (state) {
+    case 'not_observed':
+      return 'The surface has not answered a call yet, so nothing is known about conflict detection.';
+    case 'unavailable':
+      return 'The surface mints no revision, so writes are unpinned and a concurrent edit will be lost silently.';
+    case 'minted':
+      return 'The surface mints revisions and every call is pinned. Whether it ENFORCES the pin is not observable from here.';
+    case 'enforced':
+      return 'The surface has refused a stale pin, so enforcement is proven rather than assumed.';
+  }
+}
 
 export const PRIORITIES = ['background', 'normal', 'attention', 'blocking'] as const;
 
@@ -159,6 +275,437 @@ function withoutTrailingSlashes(url: string): string {
 }
 
 /**
+ * An opaque marker for "the version of the surface the agent last saw".
+ *
+ * ## Why an opaque token and not a number
+ *
+ * This package does not know what a surface's state IS. Tools come from the
+ * surface's own `tools/list` and it never models the data behind them, so it
+ * cannot compute a version, compare two, or merge anything.
+ *
+ * What it can do is CARRY a marker the surface minted, hand it back on the next
+ * call, and refuse when the surface says the marker is stale. That is
+ * optimistic concurrency with the comparison left where the knowledge is.
+ *
+ * The token is never parsed, never ordered, never inspected. An ETag, a Lamport
+ * counter, a row version, a content hash — all work here, and this class cannot
+ * tell which it is holding.
+ */
+export class SurfaceRevision {
+  private constructor(
+    /** The surface's own marker, moved but never interpreted. */
+    readonly token: string,
+    /** Which tool call observed it. Diagnostic only — never a decision. */
+    readonly observedFrom: string,
+  ) {}
+
+  static observed(token: string, observedFrom: string): SurfaceRevision {
+    const trimmed = token.trim();
+
+    if (trimmed === '') {
+      throw new HumanPlusError(
+        'A surface revision cannot be empty; omit it instead of sending a blank marker.',
+      );
+    }
+
+    // A ceiling, because this is stored on the attachment and echoed on every
+    // subsequent call. A surface that put its whole state in the revision would
+    // otherwise turn durable storage and every request body into a copy of the
+    // document.
+    if (Buffer.byteLength(trimmed, 'utf8') > 512) {
+      throw new HumanPlusError(
+        'A surface revision marker is longer than 512 bytes; a revision is an identifier, not a payload.',
+      );
+    }
+
+    return new SurfaceRevision(trimmed, observedFrom);
+  }
+
+  /**
+   * Pull a revision out of whatever the surface returned, or null.
+   *
+   * Several key names because this half of the wire is the surface's, and the
+   * first consumer's relay is not the only one that will ever be bound. `_meta`
+   * is where MCP puts implementation data, so it is checked first.
+   */
+  static fromResult(result: JsonObject, observedFrom: string): SurfaceRevision | null {
+    const meta = asObject(result['_meta']) ?? {};
+
+    for (const key of ['revision', 'surfaceRevision', 'surface_revision', 'version', 'etag']) {
+      for (const source of [meta, result]) {
+        const value = source[key];
+
+        if (typeof value === 'string' && value.trim() !== '') {
+          return SurfaceRevision.observed(value, observedFrom);
+        }
+
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return SurfaceRevision.observed(String(value), observedFrom);
+        }
+      }
+    }
+
+    return null;
+  }
+
+  toObject(): JsonObject {
+    return { token: this.token, observed_from: this.observedFrom };
+  }
+}
+
+function asObject(value: unknown): JsonObject | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as JsonObject)
+    : null;
+}
+
+/**
+ * How much this surface has been OBSERVED to be able to say about what changed
+ * — which, as with {@link ConflictDetection}, is less than "offers a tool".
+ *
+ * A change feed has the same trap as conflict detection, twice over:
+ *
+ * 1. **An empty answer is ambiguous.** "Nothing changed since your marker" and
+ *    "I cannot answer that question" are the same empty array on the wire. One
+ *    value for both would make silence read as calm, and an agent that reads
+ *    silence as calm is the agent that reverts a human's edit believing it is
+ *    fixing drift.
+ * 2. **A feed without attribution cannot prevent the thing it exists for.**
+ *    Knowing a handle moved does not say whether a PERSON moved it or whether
+ *    the agent is looking at its own last write.
+ *
+ * - `not_observed` — the surface has not listed its tools yet.
+ * - `unavailable` — it offers no feed. "What changed" is UNANSWERABLE here, and
+ *   the absence must not be read as quiet. The one definite negative.
+ * - `offered` — a feed exists. Whether it names WHO is not observable until
+ *   something changes. Half a green light.
+ * - `attributed` — it has named a hand other than this agent's. Proven.
+ *
+ * There is no "require attribution" mode, for the same reason there is no
+ * "require enforcement" one: a surface nobody else is editing never reports a
+ * human change and is indistinguishable from one that cannot.
+ */
+export const CHANGE_FEEDS = ['not_observed', 'unavailable', 'offered', 'attributed'] as const;
+
+export type ChangeFeed = (typeof CHANGE_FEEDS)[number];
+
+/** Can this surface answer "what changed since X" at all? */
+export function changeFeedAnswers(feed: ChangeFeed): boolean {
+  return feed === 'offered' || feed === 'attributed';
+}
+
+/** One sentence saying exactly what is known, for an operator or a log. */
+export function describeChangeFeed(feed: ChangeFeed): string {
+  switch (feed) {
+    case 'not_observed':
+      return 'The surface has not listed its tools yet, so nothing is known about a change feed.';
+    case 'unavailable':
+      return 'The surface offers no change feed, so what a human changed cannot be known here. An empty answer is not evidence that nothing changed.';
+    case 'offered':
+      return 'The surface offers a change feed. Whether it names WHO made a change is not observable until something changes.';
+    case 'attributed':
+      return 'The surface has reported a change made by someone other than this agent, so attribution is proven rather than assumed.';
+  }
+}
+
+/**
+ * Who made a change — the field the whole change feed exists for.
+ *
+ * "What changed" without "who" does not stop the revert: the agent's own last
+ * write is in the list and looks exactly like a person's.
+ *
+ * `unknown` is a case and not a null. A change whose actor the surface did not
+ * name is not a change nobody made, and it is not this agent's; collapsing it
+ * into either is the mistake.
+ */
+export const CHANGE_ACTORS = ['human', 'agent', 'other', 'unknown'] as const;
+
+export type ChangeActor = (typeof CHANGE_ACTORS)[number];
+
+/**
+ * Map whatever the surface called it onto an actor, without guessing.
+ *
+ * Anything unrecognised is `unknown` rather than a default — a surface that
+ * says `"actor": "operator"` means something, and quietly deciding it means
+ * `agent` would be the revert bug arriving through the parser.
+ */
+export function parseChangeActor(value: unknown): ChangeActor {
+  if (typeof value !== 'string') return 'unknown';
+
+  switch (value.trim().toLowerCase()) {
+    case 'human':
+    case 'user':
+    case 'person':
+    case 'operator':
+      return 'human';
+    case 'agent':
+    case 'assistant':
+    case 'self':
+    case 'me':
+      return 'agent';
+    case 'other':
+    case 'system':
+    case 'job':
+    case 'service':
+      return 'other';
+    default:
+      return 'unknown';
+  }
+}
+
+/**
+ * Should an agent leave a change by this actor alone rather than correct it?
+ *
+ * Only meaningful when the feed is `attributed`. Ask
+ * {@link SurfaceChanges.deferTo} instead, which knows whether the surface can
+ * attribute anything at all: on a surface where every write path is an agent
+ * tool, EVERY change is `unknown` for a structural reason, and an agent
+ * deferring to all of them could never correct its own work.
+ */
+export function actorDeservesDeference(actor: ChangeActor): boolean {
+  return actor !== 'agent';
+}
+
+/**
+ * What kind of change happened to a handle.
+ *
+ * Coarse on purpose — this package does not model the surface's data and should
+ * not pretend to describe a change in the surface's terms.
+ *
+ * `moved` earns its place separately from `updated` because it is the silent
+ * one: a human reorders, every handle stays valid, every position is now wrong,
+ * and nothing errors. An agent told only "updated" has no reason to re-read
+ * positions it believes it set.
+ */
+export const CHANGE_KINDS = ['created', 'updated', 'deleted', 'moved', 'unknown'] as const;
+
+export type ChangeKind = (typeof CHANGE_KINDS)[number];
+
+/** Map whatever the surface called it onto a kind. Unrecognised is `unknown`. */
+export function parseChangeKind(value: unknown): ChangeKind {
+  if (typeof value !== 'string') return 'unknown';
+
+  switch (value.trim().toLowerCase()) {
+    case 'created':
+    case 'create':
+    case 'added':
+    case 'add':
+    case 'inserted':
+      return 'created';
+    case 'updated':
+    case 'update':
+    case 'changed':
+    case 'edited':
+    case 'modified':
+      return 'updated';
+    case 'deleted':
+    case 'delete':
+    case 'removed':
+    case 'remove':
+      return 'deleted';
+    case 'moved':
+    case 'move':
+    case 'reordered':
+    case 'reorder':
+    case 'reparented':
+      return 'moved';
+    default:
+      return 'unknown';
+  }
+}
+
+/**
+ * One thing that happened to the surface since a marker.
+ *
+ * Four fields, and the restraint is the design. This package cannot say what a
+ * screen IS or how it differs — only that a handle the agent knows about was
+ * created, updated, moved or deleted, and by whom. That is enough for an agent
+ * to decide whether to re-read before writing.
+ */
+export class SurfaceChange {
+  constructor(
+    /** The surface's own id for the thing that changed. Never parsed here. */
+    readonly handle: string,
+    readonly kind: ChangeKind,
+    readonly actor: ChangeActor,
+    /** The surface's own label for it, or empty. Untrusted text. */
+    readonly label: string = '',
+  ) {}
+
+  /**
+   * Read one change out of whatever the surface returned.
+   *
+   * **`kind` is read from the CHANGE, not from the thing.** A surface that
+   * returns `change: "updated"` beside `kind: "chart"` — the component type —
+   * is already the shape in the wild, and taking `kind` would parse a component
+   * type as an event type. The change keys are checked first.
+   */
+  static from(row: JsonObject): SurfaceChange | null {
+    let handle: string | null = null;
+
+    for (const key of ['handle', 'id', 'screen_id', 'screenId', 'node_id', 'nodeId', 'key']) {
+      const value = row[key];
+
+      if (typeof value === 'string' && value.trim() !== '') {
+        handle = value.trim();
+        break;
+      }
+
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        handle = String(value);
+        break;
+      }
+    }
+
+    // A change nobody can point at is not one this package can hand to an
+    // agent. Dropped rather than invented a handle for.
+    if (handle === null) return null;
+
+    let kind: ChangeKind = 'unknown';
+
+    for (const key of ['change', 'change_kind', 'changeKind', 'event', 'action', 'op', 'kind']) {
+      if (!(key in row)) continue;
+
+      const read = parseChangeKind(row[key]);
+
+      if (read !== 'unknown') {
+        kind = read;
+        break;
+      }
+    }
+
+    let actor: ChangeActor = 'unknown';
+
+    for (const key of ['actor_type', 'actorType', 'actor', 'by', 'author', 'changed_by', 'changedBy']) {
+      if (!(key in row)) continue;
+
+      const read = parseChangeActor(row[key]);
+
+      if (read !== 'unknown') {
+        actor = read;
+        break;
+      }
+    }
+
+    let label = '';
+
+    for (const key of ['label', 'title', 'name', 'component', 'component_kind']) {
+      const value = row[key];
+
+      if (typeof value === 'string' && value.trim() !== '') {
+        label = value.trim();
+        break;
+      }
+    }
+
+    return new SurfaceChange(handle, kind, actor, label);
+  }
+
+  toObject(): JsonObject {
+    return { handle: this.handle, kind: this.kind, actor: this.actor, label: this.label };
+  }
+}
+
+/**
+ * What a surface said changed since a marker — and, first, whether it was in
+ * any position to say.
+ *
+ * ## The empty list is the dangerous value
+ *
+ * Returning a bare array would make "nothing changed" and "I cannot answer"
+ * indistinguishable. So {@link feed} comes first and {@link answered} is the
+ * question to ask before {@link changes} means anything.
+ *
+ * ## Incomplete feeds are a real case
+ *
+ * The first surface asked can report creates, updates and layout moves since a
+ * marker, and cannot report a delete at all — the row is hard-deleted, the head
+ * does not advance, there is no tombstone. "Nothing changed" is what it says
+ * when a screen was destroyed. A package cannot detect that from outside; it
+ * can let the surface SAY so, and {@link complete} carries the admission.
+ */
+export class SurfaceChanges {
+  constructor(
+    readonly feed: ChangeFeed,
+    readonly changes: readonly SurfaceChange[] = [],
+    /** The marker these changes are current as of — hand it back next turn. */
+    readonly revision: SurfaceRevision | null = null,
+    /** False when the surface declared its answer partial, or could not answer. */
+    readonly complete: boolean = true,
+  ) {}
+
+  /** No feed here. Nothing below this means anything. */
+  static unavailable(): SurfaceChanges {
+    return new SurfaceChanges('unavailable', [], null, false);
+  }
+
+  /**
+   * Did the surface actually answer the question?
+   *
+   * **Check this before reading {@link changes}.** An empty list from a surface
+   * with no feed is not evidence of quiet.
+   */
+  answered(): boolean {
+    return changeFeedAnswers(this.feed);
+  }
+
+  /**
+   * Is it safe to conclude that nothing changed?
+   *
+   * True only when the surface could answer, did answer, said nothing changed,
+   * and did not warn that its answer is partial.
+   */
+  nothingChanged(): boolean {
+    return this.answered() && this.complete && this.changes.length === 0;
+  }
+
+  /** Can this surface tell one hand from another at all? */
+  attributes(): boolean {
+    return this.feed === 'attributed';
+  }
+
+  /**
+   * The changes an agent should leave alone rather than correct.
+   *
+   * **A change is deferred to unless the surface positively said this agent
+   * made it.** One rule, and it lands correctly in both worlds: a surface that
+   * cannot attribute reports everything as `unknown`, so all of it is deferred
+   * to — not because it is all a person's, but because none can be SHOWN to be
+   * the agent's own, and undoing a person's work is the expensive mistake.
+   */
+  deferTo(): SurfaceChange[] {
+    if (!this.answered()) return [];
+
+    return this.changes.filter((change) => actorDeservesDeference(change.actor));
+  }
+
+  /** Every handle that moved, for an agent deciding what to re-read. */
+  handles(): string[] {
+    return [...new Set(this.changes.map((change) => change.handle))];
+  }
+
+  /** One sentence an agent or an operator can act on. */
+  describe(): string {
+    if (!this.answered()) return describeChangeFeed(this.feed);
+
+    let summary =
+      this.changes.length === 0
+        ? 'The surface reports no changes since the last marker.'
+        : `The surface reports ${this.changes.length} change(s) since the last marker.`;
+
+    if (!this.complete) {
+      summary += ' The surface declared this answer PARTIAL, so some changes are not in it.';
+    }
+
+    if (!this.attributes()) {
+      summary += ' It has never named an actor, so who made these changes is not known here.';
+    }
+
+    return summary;
+  }
+}
+
+/**
  * One agent's seat on one surface.
  *
  * `generation` is what makes concurrent workers safe: a store can refuse a
@@ -175,17 +722,119 @@ export class SurfaceAttachment {
     readonly clientId: string,
     readonly generation: number = 0,
     readonly state: AttachmentState = 'attached',
+    /** The marker the surface last minted, carried to the next call. */
+    readonly revision: SurfaceRevision | null = null,
+    readonly conflictDetection: ConflictDetection = 'not_observed',
+    /** What this surface has been seen able to say about WHO changed what. */
+    readonly changeFeed: ChangeFeed = 'not_observed',
   ) {}
 
-  transition(state: AttachmentState): SurfaceAttachment {
+  #with(
+    generation: number,
+    state: AttachmentState,
+    revision: SurfaceRevision | null,
+    conflictDetection: ConflictDetection,
+    changeFeed: ChangeFeed,
+  ): SurfaceAttachment {
     return new SurfaceAttachment(
       this.id,
       this.owner,
       this.invitation,
       this.participant,
       this.clientId,
+      generation,
+      state,
+      revision,
+      conflictDetection,
+      changeFeed,
+    );
+  }
+
+  transition(state: AttachmentState): SurfaceAttachment {
+    return this.#with(
       this.generation + 1,
       state,
+      this.revision,
+      this.conflictDetection,
+      this.changeFeed,
+    );
+  }
+
+  /**
+   * Record the marker a call observed.
+   *
+   * Seeing a revision proves minting, so it upgrades OUT of `unavailable` — a
+   * surface that answered once without one and mints later plainly does mint.
+   * `enforced` is never downgraded: it was proven by a refusal that happened.
+   */
+  withRevision(revision: SurfaceRevision | null): SurfaceAttachment {
+    const detection: ConflictDetection =
+      revision !== null && this.conflictDetection !== 'enforced' ? 'minted' : this.conflictDetection;
+
+    return this.#with(this.generation, this.state, revision, detection, this.changeFeed);
+  }
+
+  /**
+   * Record that the surface actually REFUSED a stale pin.
+   *
+   * The only positive proof of enforcement available, and it is permanent: a
+   * refusal that happened cannot un-happen. It also drops the marker, which is
+   * the recovery path — an agent left holding a stale token cannot refresh it,
+   * because a surface gating reads on the marker refuses the very read that
+   * would refresh.
+   */
+  observingEnforcement(): SurfaceAttachment {
+    return this.#with(this.generation, this.state, null, 'enforced', this.changeFeed);
+  }
+
+  /**
+   * Record that the surface answered and minted nothing.
+   *
+   * Only ever moves `not_observed` → `unavailable`. A surface that supplied a
+   * revision once and then had nothing new to say still mints them.
+   */
+  observingNoRevision(): SurfaceAttachment {
+    if (this.conflictDetection !== 'not_observed') return this;
+
+    return this.#with(this.generation, this.state, this.revision, 'unavailable', this.changeFeed);
+  }
+
+  /** Forget the revision, so the next call goes out unpinned. */
+  withoutRevision(): SurfaceAttachment {
+    return this.#with(this.generation, this.state, null, this.conflictDetection, this.changeFeed);
+  }
+
+  /**
+   * Record what the surface's tool list said about a change feed.
+   *
+   * Never downgrades a proven `attributed`: a surface that listed a shorter set
+   * of tools has not stopped being able to attribute what it already did.
+   */
+  observingChangeFeed(offered: boolean): SurfaceAttachment {
+    if (this.changeFeed === 'attributed') return this;
+
+    const feed: ChangeFeed = offered ? 'offered' : 'unavailable';
+
+    if (feed === this.changeFeed) return this;
+
+    return this.#with(this.generation, this.state, this.revision, this.conflictDetection, feed);
+  }
+
+  /**
+   * Record that the surface named someone who is not this agent.
+   *
+   * Permanent, for the same reason enforcement is: it happened. A later turn
+   * where only the agent wrote proves nothing either way.
+   */
+  observingAttribution(): SurfaceAttachment {
+    if (this.changeFeed === 'attributed') return this;
+
+    return this.#with(
+      this.generation,
+      this.state,
+      this.revision,
+      this.conflictDetection,
+      'attributed',
     );
   }
 }
@@ -650,10 +1299,57 @@ export class LegacyMcpClient {
     attachment: SurfaceAttachment,
     name: string,
     args: JsonObject,
+    revision: SurfaceRevision | null = null,
   ): Promise<JsonObject> {
     await this.initialize(attachment);
 
-    return this.request(attachment, 'tools/call', { name, arguments: args });
+    const params: JsonObject = { name, arguments: args };
+
+    // PINNED ON EVERY CALL, not only on the ones that look like writes.
+    //
+    // The package cannot tell a read from a write: tool names come from the
+    // surface, and MCP's `readOnlyHint` is explicitly a hint the spec says not
+    // to trust for security decisions. Deciding from it would let a surface
+    // mark a mutating tool read-only and have its writes go out unpinned — the
+    // one direction that must not be possible.
+    //
+    // Pinning a read costs nothing: a read overwrites nothing, so the worst
+    // case is a surface choosing to refuse a stale read, which is its call to
+    // make and recoverable because a rejection drops the marker.
+    if (revision !== null) {
+      params['_meta'] = { revision: revision.token };
+    }
+
+    return this.request(attachment, 'tools/call', params);
+  }
+
+  /**
+   * Is this error the surface saying "your revision is stale"?
+   *
+   * Several spellings because this half of the wire is the surface's. JSON-RPC
+   * has no precondition code of its own, so implementations reach for an
+   * application code in `data`, a string code, or the HTTP status they would
+   * have sent. Recognising one shape only would mean a surface that protects
+   * its state correctly still loses updates through this client.
+   */
+  static #rejectsRevision(error: JsonObject): boolean {
+    const data = asObject(error['data']);
+    const candidates: unknown[] = [error['code'], data?.['code'], data?.['reason']];
+
+    return candidates.some((candidate) => {
+      if (candidate === 409) return true;
+
+      return (
+        typeof candidate === 'string' &&
+        [
+          'conflict',
+          'revision_mismatch',
+          'revision_stale',
+          'precondition_failed',
+          'stale_revision',
+        ].includes(candidate.trim().toLowerCase())
+      );
+    });
   }
 
   private async request(
@@ -675,7 +1371,26 @@ export class LegacyMcpClient {
     }
 
     if (response['error'] !== undefined) {
-      throw new HumanPlusError('Fancy surface returned a JSON-RPC error.');
+      const error = asObject(response['error']) ?? {};
+
+      if (LegacyMcpClient.#rejectsRevision(error)) {
+        throw new SurfaceRevisionRejected(
+          'The Fancy surface rejected the revision this call was pinned to.',
+        );
+      }
+
+      // The surface's own reason, not discarded. Without it a misconfigured
+      // tool, a refused argument and an internal error are one
+      // indistinguishable sentence, and the reason is the only part that tells
+      // anyone what to do about it.
+      const code = error['code'];
+      const message = error['message'];
+
+      throw new HumanPlusError(
+        `Fancy surface returned a JSON-RPC error${
+          typeof code === 'string' || typeof code === 'number' ? ` [${code}]` : ''
+        }${typeof message === 'string' && message.trim() !== '' ? `: ${message}` : ''}.`,
+      );
     }
 
     const result = response['result'];
@@ -686,6 +1401,71 @@ export class LegacyMcpClient {
 
     return result;
   }
+}
+
+/**
+ * The tool names a surface may offer a change feed under.
+ *
+ * Several, because this half of the wire is the surface's. Matched
+ * case-insensitively and nothing else: a tool that merely looks like a feed is
+ * not called speculatively.
+ */
+const CHANGE_FEED_TOOLS = [
+  'changes_since',
+  'changessince',
+  'surface_changes',
+  'surfacechanges',
+  'what_changed',
+  'whatchanged',
+  'changes',
+];
+
+/**
+ * The rows of changes in whatever shape the surface returned them.
+ *
+ * `_meta` first, then the top level — the same order
+ * {@link SurfaceRevision.fromResult} looks in, because MCP puts implementation
+ * data there.
+ */
+function changeRows(result: JsonObject): JsonObject[] {
+  const meta = asObject(result['_meta']) ?? {};
+
+  for (const key of ['changes', 'change_log', 'changeLog', 'events', 'screens', 'items']) {
+    for (const source of [meta, result]) {
+      const value = source[key];
+
+      if (Array.isArray(value)) {
+        return value.map(asObject).filter((row): row is JsonObject => row !== null);
+      }
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Did the surface claim this answer covers everything?
+ *
+ * **Complete unless it says otherwise.** The opposite default would mark every
+ * existing surface's answers partial for having never heard of the flag, which
+ * is a warning nobody can act on and everybody learns to skip.
+ */
+function claimsComplete(result: JsonObject): boolean {
+  const meta = asObject(result['_meta']) ?? {};
+
+  for (const key of ['complete', 'is_complete', 'isComplete']) {
+    for (const source of [meta, result]) {
+      if (key in source) return Boolean(source[key]);
+    }
+  }
+
+  for (const key of ['partial', 'is_partial', 'isPartial', 'truncated']) {
+    for (const source of [meta, result]) {
+      if (key in source) return !source[key];
+    }
+  }
+
+  return true;
 }
 
 // -- the manager -------------------------------------------------------------
@@ -705,8 +1485,131 @@ export class HumanPlusManager {
     private readonly store: AttachmentStore,
     private readonly trust: TrustPolicy,
     private readonly guard: ResultGuard = new ResultGuard(),
+    /**
+     * Refuse to call a surface that has answered and minted no revision.
+     *
+     * Off by default, because a surface with one writer is not in danger and
+     * refusing it would be this package's opinion rather than a protection.
+     * On, it is a host saying "this run must not risk a lost update".
+     */
+    private readonly requireRevision: boolean = false,
   ) {
     this.#client = new LegacyMcpClient(transport);
+  }
+
+  /**
+   * How much lost-update protection this surface has been OBSERVED to have.
+   *
+   * A check rather than a claim. Read {@link ConflictDetection} before acting
+   * on it: the state that matters most is `minted`, which means this package is
+   * pinning every call and **cannot see whether the surface enforces the pin**.
+   */
+  async conflictDetection(owner: Owner, id: string): Promise<ConflictDetection> {
+    return this.store.lock(id, async () => (await this.required(owner, id)).conflictDetection);
+  }
+
+  /**
+   * What changed on this surface since the marker the agent last saw.
+   *
+   * {@link SurfaceRevision} stops an agent overwriting a change it did not know
+   * about. It does NOTHING about an agent that re-reads, sees current state,
+   * decides the surface has drifted from what it intended, and puts it back —
+   * over a person's edit, with nothing stale anywhere and no error at any
+   * layer. Optimistic concurrency answers "did the world move under me"; this
+   * answers "what did somebody else do", which is the question that stops the
+   * revert.
+   *
+   * **Read {@link SurfaceChanges.answered} before reading the list.** A surface
+   * with no feed and a surface with nothing to report produce the same empty
+   * array.
+   */
+  async changesSince(owner: Owner, id: string): Promise<SurfaceChanges> {
+    return this.store.lock(id, async () => {
+      this.trust.assertDeclared();
+
+      let attachment = await this.required(owner, id);
+      const feedTool = (await this.discover(attachment)).find((candidate) =>
+        CHANGE_FEED_TOOLS.includes(candidate.name.toLowerCase()),
+      );
+
+      if (feedTool === undefined) {
+        // Recorded, not just returned. A later turn should not have to
+        // re-derive that this surface cannot answer, and an operator should be
+        // able to see it on the attachment.
+        const next = attachment.observingChangeFeed(false);
+
+        if (next !== attachment) await this.store.put(next, attachment.generation);
+
+        return SurfaceChanges.unavailable();
+      }
+
+      attachment = attachment.observingChangeFeed(true);
+
+      const pinned = attachment.revision;
+      let result: JsonObject;
+
+      try {
+        result = await this.#client.call(
+          attachment,
+          feedTool.name,
+          pinned === null ? {} : { since: pinned.token },
+          pinned,
+        );
+      } catch (failure) {
+        if (failure instanceof SurfaceRevisionRejected) {
+          // The READ was refused for carrying a stale marker. Drop it and say
+          // the question went unanswered, exactly as `call()` does.
+          await this.store.put(attachment.observingEnforcement(), attachment.generation);
+
+          throw SurfaceChangedUnderYou.while(feedTool.name, pinned);
+        }
+
+        await this.recordTerminal(attachment, failure);
+        throw failure;
+      }
+
+      const changes: SurfaceChange[] = [];
+      let attributed = false;
+
+      for (const row of changeRows(result)) {
+        const change = SurfaceChange.from(row);
+
+        if (change === null) continue;
+
+        changes.push(
+          change.label === ''
+            ? change
+            : new SurfaceChange(
+                change.handle,
+                change.kind,
+                change.actor,
+                // The surface's own words, guarded like any other text coming
+                // back from a running application.
+                this.guard.guard(attachment.invitation.surfaceId, feedTool.name, change.label),
+              ),
+        );
+
+        // Proof arrives only when the surface names a hand that is NOT this
+        // agent's. A feed that can only ever say "agent" has not shown it can
+        // tell a person's edit from its own. Evidence when it arrives, never a
+        // precondition — the same rule as `enforced`.
+        if (change.actor === 'human' || change.actor === 'other') attributed = true;
+      }
+
+      const observed = SurfaceRevision.fromResult(result, feedTool.name);
+
+      if (observed !== null) attachment = attachment.withRevision(observed);
+      if (attributed) attachment = attachment.observingAttribution();
+
+      await this.store.put(attachment, attachment.generation);
+
+      return new SurfaceChanges(
+        attachment.changeFeed,
+        changes,
+        attachment.revision,
+        claimsComplete(result),
+      );
+    });
   }
 
   async attach(
@@ -751,14 +1654,41 @@ export class HumanPlusManager {
         throw new ToolRefused(`Human+ tool [${tool}] is not trusted or was not offered.`);
       }
 
+      // The first call is always allowed: there is no way to know what a
+      // surface supplies before it has answered once, and refusing it would
+      // refuse the very read that finds out.
+      if (this.requireRevision && attachment.conflictDetection === 'unavailable') {
+        throw ConflictDetectionUnavailable.forSurface(attachment.invitation.surfaceId, tool);
+      }
+
+      const pinned = attachment.revision;
       let result: JsonObject;
 
       try {
-        result = await this.#client.call(attachment, tool, args);
+        result = await this.#client.call(attachment, tool, args, pinned);
       } catch (failure) {
+        if (failure instanceof SurfaceRevisionRejected) {
+          // DROP THE MARKER, then refuse. Without the drop the agent is stuck:
+          // every later call carries the same stale token, and a surface that
+          // gates reads on it refuses the read that would refresh.
+          //
+          // The attachment is NOT transitioned: a conflict is a normal outcome
+          // of two writers, not a lifecycle failure, and marking the surface
+          // unavailable would end a session that is healthy.
+          await this.store.put(attachment.observingEnforcement(), attachment.generation);
+
+          throw SurfaceChangedUnderYou.while(tool, pinned);
+        }
+
         await this.recordTerminal(attachment, failure);
         throw failure;
       }
+
+      const observed = SurfaceRevision.fromResult(result, tool);
+      const next =
+        observed === null ? attachment.observingNoRevision() : attachment.withRevision(observed);
+
+      if (next !== attachment) await this.store.put(next, attachment.generation);
 
       const text = textOf(result['content']);
 
