@@ -339,7 +339,15 @@ export class SurfaceRevision {
           return SurfaceRevision.observed(value, observedFrom);
         }
 
-        if (typeof value === 'number' && Number.isFinite(value)) {
+        // A JSON number that is a whole value. PHP and Python tell int from
+        // float and JavaScript does not, so `1.0` arrives here as a float in
+        // two languages and an integer in the third — and the reference used to
+        // reject it, which meant a surface serialising a whole revision with a
+        // decimal point had its marker DROPPED and the next call went out
+        // unpinned. Fractional and unsafe values are refused in all three
+        // instead, because they have no spelling the three agree on. Pinned by
+        // human-plus-change-feed.
+        if (typeof value === 'number' && Number.isSafeInteger(value)) {
           return SurfaceRevision.observed(String(value), observedFrom);
         }
       }
@@ -637,6 +645,84 @@ export class SurfaceChanges {
   /** No feed here. Nothing below this means anything. */
   static unavailable(): SurfaceChanges {
     return new SurfaceChanges('unavailable', [], null, false);
+  }
+
+  /**
+   * Read a surface's answer into this shape.
+   *
+   * HERE RATHER THAN IN THE MANAGER, and not only for tidiness: this is the
+   * part three languages have to agree on byte for byte, so it has to be
+   * reachable by a conformance runner. One that re-implemented the read would
+   * pin what the runner believes rather than what the package does.
+   *
+   * Labels come back UNGUARDED. The manager frames them, because framing needs
+   * the surface id and a nonce, and a nonce is not comparable across languages.
+   */
+  static readFrom(result: JsonObject, feed: ChangeFeed): SurfaceChanges {
+    const changes: SurfaceChange[] = [];
+    let attributed = false;
+
+    for (const row of changeRows(result)) {
+      const change = SurfaceChange.from(row);
+
+      if (change === null) continue;
+
+      changes.push(change);
+
+      // Proof arrives only when the surface names a hand that is NOT this
+      // agent's. A feed that can only ever say "agent" has not shown it can
+      // tell a person's edit from its own.
+      if (change.actor === 'human' || change.actor === 'other') attributed = true;
+    }
+
+    return new SurfaceChanges(
+      attributed && changeFeedAnswers(feed) ? 'attributed' : feed,
+      changes,
+      SurfaceRevision.fromResult(result, 'changes'),
+      claimsComplete(result),
+    );
+  }
+
+  /**
+   * The same answer with each label passed through a framer.
+   *
+   * The manager's hook for guarding surface text without this class knowing
+   * what guarding is.
+   */
+  withFramedLabels(frame: (label: string) => string): SurfaceChanges {
+    return new SurfaceChanges(
+      this.feed,
+      this.changes.map((change) =>
+        change.label === ''
+          ? change
+          : new SurfaceChange(change.handle, change.kind, change.actor, frame(change.label)),
+      ),
+      this.revision,
+      this.complete,
+    );
+  }
+
+  /**
+   * Everything a conformance runner compares, in one shape.
+   *
+   * The DERIVED answers are here as well as the parsed rows, because the
+   * derivations are the part a port is most likely to get subtly wrong: a
+   * language that parsed every row correctly and answered `nothingChanged()` on
+   * an unanswerable feed would agree on the easy half of this and be dangerous
+   * in production.
+   */
+  toObject(): JsonObject {
+    return {
+      feed: this.feed,
+      complete: this.complete,
+      answered: this.answered(),
+      nothing_changed: this.nothingChanged(),
+      attributes: this.attributes(),
+      revision: this.revision?.token ?? null,
+      changes: this.changes.map((change) => change.toObject()),
+      defer_to: this.deferTo().map((change) => change.handle),
+      handles: this.handles(),
+    };
   }
 
   /**
@@ -1568,46 +1654,19 @@ export class HumanPlusManager {
         throw failure;
       }
 
-      const changes: SurfaceChange[] = [];
-      let attributed = false;
+      // Parsed where a conformance runner can reach it. The manager's job
+      // here is the guard and the attachment, not the shape.
+      const answer = SurfaceChanges.readFrom(result, attachment.changeFeed);
 
-      for (const row of changeRows(result)) {
-        const change = SurfaceChange.from(row);
-
-        if (change === null) continue;
-
-        changes.push(
-          change.label === ''
-            ? change
-            : new SurfaceChange(
-                change.handle,
-                change.kind,
-                change.actor,
-                // The surface's own words, guarded like any other text coming
-                // back from a running application.
-                this.guard.guard(attachment.invitation.surfaceId, feedTool.name, change.label),
-              ),
-        );
-
-        // Proof arrives only when the surface names a hand that is NOT this
-        // agent's. A feed that can only ever say "agent" has not shown it can
-        // tell a person's edit from its own. Evidence when it arrives, never a
-        // precondition — the same rule as `enforced`.
-        if (change.actor === 'human' || change.actor === 'other') attributed = true;
-      }
-
-      const observed = SurfaceRevision.fromResult(result, feedTool.name);
-
-      if (observed !== null) attachment = attachment.withRevision(observed);
-      if (attributed) attachment = attachment.observingAttribution();
+      if (answer.revision !== null) attachment = attachment.withRevision(answer.revision);
+      if (answer.feed === 'attributed') attachment = attachment.observingAttribution();
 
       await this.store.put(attachment, attachment.generation);
 
-      return new SurfaceChanges(
-        attachment.changeFeed,
-        changes,
-        attachment.revision,
-        claimsComplete(result),
+      return answer.withFramedLabels((label) =>
+        // The surface's own words, guarded like any other text coming back from
+        // a running application.
+        this.guard.guard(attachment.invitation.surfaceId, feedTool.name, label),
       );
     });
   }
