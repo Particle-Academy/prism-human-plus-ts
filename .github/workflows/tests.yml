@@ -17,7 +17,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        # 22 and 24 are the supported LTS lines; 26 is current. NODE 20 WAS
+        # REMOVED because it reached end of life on 2026-04-30 -- testing against
+        # an unsupported runtime proves a package works where nobody should run
+        # it, and declaring engines >=20 told consumers otherwise.
+        #
+        # This is a change to DECLARED SUPPORT, not just to CI, so it belongs in
+        # this package's next tag annotation as a breaking change.
+        node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
