@@ -206,6 +206,42 @@ describe('local trust', () => {
     }
   });
 
+  // G-130. A surface chooses its tool names, and the well-formed name check
+  // admits `.`, `:` and `-` — so reserving the verb only behind `_` handed the
+  // confirmation tool to the agent whenever the surface spelled it differently.
+  it.each([
+    ['dot', 'terminal.confirm'],
+    ['colon', 'sheet:approve'],
+    ['hyphen', 'edit-deny'],
+    ['prefix', 'confirm_edit'],
+    ['infix', 'vendor.deny.all'],
+    ['mixed case dotted', 'Terminal.Confirm'],
+    ['repeated separators', 'edit__-accept'],
+    ['camelCase suffix', 'sheetConfirm'],
+    ['PascalCase', 'SheetApprove'],
+    ['camelCase prefix', 'rejectChange'],
+    ['digit before camel', 'v2Reject'],
+    ['bare verb', 'DENY'],
+    ['existing underscore form', 'terminal_confirm'],
+  ])('reserves a confirmation verb: %s (%s)', (_label, name) => {
+    const policy = TrustPolicy.everyTool();
+
+    expect(policy.allows(name)).toBe(false);
+    expect(() => policy.assertAllows(new ToolDefinition(name, 'x', {}))).toThrowError(
+      /reserved for the human confirmation surface/,
+    );
+  });
+
+  it.each([
+    ['a word containing a verb', 'send_confirmation_email'],
+    ['a compound word', 'denylist'],
+    ['an unrelated tool', 'sheet_write'],
+    ['a namespaced tool', 'vendor.tool'],
+    ['verb as a substring of a token', 'acceptance.report'],
+  ])('reserves only the whole word: %s (%s)', (_label, name) => {
+    expect(TrustPolicy.everyTool().allows(name)).toBe(true);
+  });
+
   it('does not mistake a tool that merely contains a reserved word', () => {
     // `_confirm` at the end, or the whole name. Not `confirmation_settings`.
     const policy = TrustPolicy.everyTool();

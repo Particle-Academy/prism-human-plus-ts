@@ -1167,8 +1167,24 @@ const INVISIBLE = new RegExp(`^[${INVISIBLE_CLASS}]+|[${INVISIBLE_CLASS}]+$`, 'g
  * matched against the RAW name and is deliberately untouched.
  */
 function isHumanOnly(name: string): boolean {
-  return /(?:^|_)(?:confirm|reject|accept|approve|deny)$/i.test(name.replace(INVISIBLE, ''));
+  // TOKENISED, not an end-anchored pattern (G-130). The well-formed check
+  // admits `.`, `:` and `-` as well as `_`, and a surface chooses its own names,
+  // so reserving the verb only behind `_` handed `terminal.confirm`,
+  // `sheet:approve`, `confirm_edit` and `sheetConfirm` to the agent. Every
+  // separator and every camelCase boundary splits a token; the name is reserved
+  // when ANY token is a reserved verb. Whole tokens only, so
+  // `send_confirmation_email` and `denylist` stay callable. Spelled the same way
+  // in all three languages, and like the normalisation it can only reserve more.
+  return name
+    .replace(INVISIBLE, '')
+    .split(/[_.:-]+/)
+    .some((segment) =>
+      segment.split(/(?<=[a-z0-9])(?=[A-Z])/).some((token) => RESERVED_VERBS.has(token.toLowerCase())),
+    );
 }
+
+/** Verbs whose tools belong to the human confirmation surface. */
+const RESERVED_VERBS: ReadonlySet<string> = new Set(['confirm', 'reject', 'accept', 'approve', 'deny']);
 
 function constantTimeEquals(left: string, right: string): boolean {
   const a = Buffer.from(left, 'utf8');
