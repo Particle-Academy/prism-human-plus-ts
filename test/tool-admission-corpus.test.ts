@@ -83,7 +83,7 @@ const caseOf = (id: string): CorpusCase => corpus.cases.find((entry) => entry.id
 
 describe('the cross-language tool-admission corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(32);
+    expect(corpus.cases).toHaveLength(45);
   });
 
   it.each(corpus.cases)('$id decides the way the corpus recorded ($title)', (entry) => {
