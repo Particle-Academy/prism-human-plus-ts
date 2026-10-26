@@ -1,6 +1,6 @@
 {
   "name": "@particle-academy/prism-human-plus",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Humans and agents sharing one surface, across a trust boundary. TypeScript.",
   "type": "module",
   "sideEffects": false,
