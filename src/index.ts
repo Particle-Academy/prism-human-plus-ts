@@ -1,5 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
+import { promises as dns } from 'node:dns';
+import { isNonPublicAddress } from './relay-address-policy.js';
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
 export interface JsonObject {
@@ -2081,7 +2083,7 @@ export class SsePostRelayTransport implements RelayTransport {
   }
 
   async exchange(attachment: SurfaceAttachment, frame: JsonObject): Promise<JsonObject> {
-    const base = this.base(attachment);
+    const base = await this.base(attachment);
     const expectedId = frame['id'];
 
     const post = await this.http.post(
@@ -2093,7 +2095,7 @@ export class SsePostRelayTransport implements RelayTransport {
     this.assertLive(post.status, post.body);
 
     const stream = await this.http.stream(
-      `${base}/events?${this.query(attachment, { direction: 'outbound' })}`,
+      `${await this.base(attachment)}/events?${this.query(attachment, { direction: 'outbound' })}`,
       this.headers(attachment, { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' }),
     );
 
@@ -2141,7 +2143,7 @@ export class SsePostRelayTransport implements RelayTransport {
 
   async notify(attachment: SurfaceAttachment, frame: JsonObject): Promise<void> {
     const response = await this.http.post(
-      `${this.base(attachment)}/inbox?${this.query(attachment)}`,
+      `${await this.base(attachment)}/inbox?${this.query(attachment)}`,
       this.headers(attachment, { 'Content-Type': 'application/json' }),
       JSON.stringify(frame),
     );
@@ -2151,7 +2153,7 @@ export class SsePostRelayTransport implements RelayTransport {
 
   async detach(attachment: SurfaceAttachment): Promise<void> {
     const response = await this.http.post(
-      `${this.base(attachment)}/unregister?${this.query(attachment)}`,
+      `${await this.base(attachment)}/unregister?${this.query(attachment)}`,
       this.headers(attachment),
       '',
     );
@@ -2167,7 +2169,7 @@ export class SsePostRelayTransport implements RelayTransport {
     return this.#egressProxy;
   }
 
-  private base(attachment: SurfaceAttachment): string {
+  private async base(attachment: SurfaceAttachment): Promise<string> {
     const url = withoutTrailingSlashes(attachment.invitation.relayBaseUrl);
 
     if (this.#egressProxy === null && !this.#allowUnverifiedEgress) {
@@ -2216,24 +2218,28 @@ export class SsePostRelayTransport implements RelayTransport {
       );
     }
 
-    if (!insecureLoopback) this.assertPublicHost(host);
+    if (!insecureLoopback) await this.assertPublicHost(host);
 
     return `${url}/${encodeURIComponent(attachment.invitation.sessionId)}`;
   }
 
-  /**
-   * A LITERAL private address is refused outright.
-   *
-   * A NAME is not resolved here, and the reference's DNS check is deliberately
-   * not carried over: a lookup in the client is not a rebinding boundary — the
-   * address the HTTP client eventually connects to can differ from the one this
-   * saw. The egress proxy is the boundary, which is why it is required by
-   * default and why turning it off is spelled `allowUnverifiedEgress`.
-   */
-  private assertPublicHost(host: string): void {
-    if (isIP(host) === 0 && !(host.startsWith('[') && host.endsWith(']'))) return;
-
-    if (isPrivateAddress(host)) {
+  /** Local preflight complements the trusted proxy; it cannot pin the later connection. */
+  private async assertPublicHost(host: string): Promise<void> {
+    const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+    if (isIP(bare) !== 0) {
+      if (isNonPublicAddress(bare)) {
+        throw new AttachmentUnauthorized('Human+ relay resolved to a private or reserved address.');
+      }
+      return;
+    }
+    if (this.#allowUnverifiedEgress) return;
+    let records;
+    try {
+      records = await dns.lookup(bare, { all: true, verbatim: true });
+    } catch {
+      throw new AttachmentUnauthorized('Human+ relay host did not resolve to a public address.');
+    }
+    if (records.length === 0 || records.some(record => isNonPublicAddress(record.address))) {
       throw new AttachmentUnauthorized('Human+ relay resolved to a private or reserved address.');
     }
   }
@@ -2262,7 +2268,7 @@ export class SsePostRelayTransport implements RelayTransport {
   private assertLive(status: number, body: string, detaching = false): void {
     if (status >= 200 && status < 300) return;
 
-    if (status === 410 || body.includes('session_gone')) {
+    if (status === 410) {
       if (detaching) return;
 
       throw new SurfaceUnavailable('The Fancy surface is gone; this attachment cannot resume.');
@@ -2270,6 +2276,10 @@ export class SsePostRelayTransport implements RelayTransport {
 
     if (status === 401) {
       throw new AttachmentUnauthorized('The Fancy surface attachment is unauthorized.');
+    }
+
+    if (status === 409) {
+      throw new SurfaceRevisionRejected('The Fancy relay rejected the revision this call was pinned to.');
     }
 
     throw new HumanPlusError(`Fancy relay failed with HTTP ${status}.`);
@@ -2284,29 +2294,4 @@ function eventData(event: string): string | null {
   }
 
   return data.length === 0 ? null : data.join('\n');
-}
-
-function isPrivateAddress(host: string): boolean {
-  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
-
-  if (bare === '::1' || bare === '::' || bare.toLowerCase().startsWith('fc') || bare.toLowerCase().startsWith('fd')) {
-    return true;
-  }
-
-  const octets = bare.split('.');
-
-  if (octets.length !== 4 || !octets.every((part) => /^\d+$/.test(part))) return false;
-
-  const [a, b] = octets.map(Number) as [number, number, number, number];
-
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    a >= 224
-  );
 }

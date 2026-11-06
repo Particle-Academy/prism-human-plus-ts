@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   Activity,
   AttachmentUnauthorized,
@@ -23,6 +23,8 @@ import {
   type RelayStream,
   type RelayTransport,
 } from '../src/index.js';
+
+vi.mock('node:dns', () => ({ promises: { lookup: vi.fn(async () => [{ address: '8.8.8.8', family: 4 }]) } }));
 
 const participant: Participant = { id: 'agent:prism', name: 'Prism', color: '#7c3aed' };
 
@@ -855,14 +857,14 @@ describe('the SSE + POST relay', () => {
     );
   });
 
-  it('reads session_gone out of the body even on a non-410 status', async () => {
+  it('keeps an HTTP failure category despite a session_gone body', async () => {
     const http = new FakeHttp();
 
     http.postStatus = 400;
     http.postBody = '{"error":"session_gone"}';
 
     await expect(transport(http).notify(relayAttachment(), {})).rejects.toThrowError(
-      SurfaceUnavailable,
+      /Fancy relay failed with HTTP 400/,
     );
   });
 

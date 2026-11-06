@@ -82,6 +82,18 @@ anyone else reaches for it. The relay also refuses to resolve to a private or
 reserved address — the same SSRF reasoning as `prism-browser`, applied to a
 surface that fetches on an agent's behalf.
 
+## Relay policy
+
+Each POST and GET validates the relay URL and all local DNS answers. Empty,
+failed, mixed, private, and reserved results are refused. The HTTP client must
+route through the declared trusted egress proxy: local preflight cannot pin
+its later connection. `allowUnverifiedEgress` remains an explicit mode for
+isolated local testing and skips named-host DNS verification.
+
+HTTP 401 raises `AttachmentUnauthorized`, 409 raises `SurfaceRevisionRejected`,
+and 410 raises `SurfaceUnavailable`. A detach on 410 succeeds. Response body
+text does not change the HTTP failure category.
+
 ## Parity
 
 Pinned against the PHP reference and the Python port by prism-parity's
