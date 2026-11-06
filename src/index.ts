@@ -1361,7 +1361,7 @@ export class LegacyMcpClient {
     const response = await this.request(attachment, 'initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'prism-human-plus', version: '0.1.0' },
+      clientInfo: { name: 'prism-human-plus', version: '0.5.0' },
     });
 
     const version = response['protocolVersion'];
